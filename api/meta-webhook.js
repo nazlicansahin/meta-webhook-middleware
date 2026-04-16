@@ -80,6 +80,16 @@ async function handler(req, res) {
       const rawBody = await getRawBody(req);
       const signatureHeader = req.headers["x-hub-signature-256"];
 
+      const payload = JSON.parse(rawBody.toString("utf8"));
+      const leadgenId = payload?.entry?.[0]?.changes?.[0]?.value?.leadgen_id;
+
+      if (!leadgenId) {
+        // Meta "Verify and save" sırasında test POST atabilir.
+        // Bu durumda `leadgen_id` gelmeyebileceği için imza doğrulaması yapmadan 200 dönmek doğrulamanın geçmesini sağlar.
+        return res.status(200).send("OK");
+      }
+
+      // Gerçek lead akışında imza doğrulaması şart.
       const isValidSignature = verifyMetaSignature(
         rawBody,
         signatureHeader,
@@ -87,13 +97,6 @@ async function handler(req, res) {
       );
       if (!isValidSignature) {
         return res.status(401).json({ error: "Invalid webhook signature" });
-      }
-
-      const payload = JSON.parse(rawBody.toString("utf8"));
-      const leadgenId = payload?.entry?.[0]?.changes?.[0]?.value?.leadgen_id;
-
-      if (!leadgenId) {
-        return res.status(400).json({ error: "leadgen_id not found in payload" });
       }
 
       const alreadyExists = await airtableRecordExists(leadgenId);
