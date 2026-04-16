@@ -1,6 +1,8 @@
-import crypto from "crypto";
+const crypto = require("crypto");
 
-export const config = {
+// Next.js API route config: raw body erişimi için bodyParser kapalı olmalı.
+// Vercel bu klasörü Next API route olarak ele alıyorsa gerekli.
+exports.config = {
   api: {
     bodyParser: false,
   },
@@ -53,14 +55,20 @@ async function airtableRecordExists(leadgenId) {
   return Array.isArray(data.records) && data.records.length > 0;
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   // 1) Meta webhook doğrulaması (GET)
   if (req.method === "GET") {
-    const challenge = req.query["hub.challenge"];
-    const token = req.query["hub.verify_token"];
+    // Meta query param isimleri noktalar içerdiği için bazı framework'ler
+    // bunları farklı parse edebiliyor (nested vs flat). İkisini de destekle.
+    const hub = req.query?.hub || {};
+    const challenge =
+      req.query?.["hub.challenge"] ?? hub["challenge"] ?? hub.challenge;
+    const token =
+      req.query?.["hub.verify_token"] ?? hub["verify_token"] ?? hub.verify_token;
 
     if (token === process.env.VERIFY_TOKEN) {
-      return res.status(200).send(challenge);
+      // Meta plain-text bekler.
+      return res.status(200).send(String(challenge ?? ""));
     }
 
     return res.status(403).send("Forbidden");
@@ -150,3 +158,5 @@ export default async function handler(req, res) {
 
   return res.status(405).json({ error: "Method not allowed" });
 }
+
+module.exports = handler;
