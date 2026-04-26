@@ -17,6 +17,12 @@ function getRawBody(req) {
   });
 }
 
+function headerString(req, name) {
+  const v = req.headers[name];
+  if (v == null) return undefined;
+  return Array.isArray(v) ? v[0] : v;
+}
+
 function verifyMetaSignature(rawBody, signatureHeader, appSecret) {
   if (!signatureHeader || !appSecret) {
     return false;
@@ -78,7 +84,7 @@ async function handler(req, res) {
   if (req.method === "POST") {
     try {
       const rawBody = await getRawBody(req);
-      const signatureHeader = req.headers["x-hub-signature-256"];
+      const signatureHeader = headerString(req, "x-hub-signature-256");
 
       const payload = JSON.parse(rawBody.toString("utf8"));
       const leadgenId = payload?.entry?.[0]?.changes?.[0]?.value?.leadgen_id;
@@ -89,7 +95,13 @@ async function handler(req, res) {
         return res.status(200).send("OK");
       }
 
-      // Gerçek lead akışında imza doğrulaması şart.
+      // Gerçek lead akışında imza doğrulaması şart (Meta: App Secret + ham gövde).
+      if (!process.env.META_APP_SECRET) {
+        return res.status(500).json({
+          error: "META_APP_SECRET is not configured on the server",
+        });
+      }
+
       const isValidSignature = verifyMetaSignature(
         rawBody,
         signatureHeader,
