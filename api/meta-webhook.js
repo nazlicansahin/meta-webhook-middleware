@@ -81,6 +81,55 @@ async function airtableRecordExists(leadgenId) {
   return Array.isArray(data.records) && data.records.length > 0;
 }
 
+/** İlk leadgen değişikliğini bul (tek POST'ta birden fazla changes olabilir). */
+function extractLeadgenFromPayload(payload) {
+  for (const ent of payload?.entry || []) {
+    for (const ch of ent?.changes || []) {
+      const v = ch?.value;
+      if (v != null && v.leadgen_id != null && String(v.leadgen_id).length > 0) {
+        return { leadgenId: String(v.leadgen_id), webhookValue: v };
+      }
+    }
+  }
+  return { leadgenId: null, webhookValue: null };
+}
+
+function graphApiVersion() {
+  const raw = String(process.env.GRAPH_API_VERSION || "v21.0").trim();
+  return raw.startsWith("v") ? raw : `v${raw}`;
+}
+
+function snapshotFieldName() {
+  return String(process.env.AIRTABLE_SNAPSHOT_FIELD || "Meta Snapshot").trim() || "Meta Snapshot";
+}
+
+function buildGraphFallbackSnapshot(webhookValue, graphStatus, leadData) {
+  const maxLen = 95000;
+  const payload = {
+    webhook_value: webhookValue || null,
+    graph_http_status: graphStatus ?? null,
+    graph_error: leadData?.error ?? leadData ?? null,
+  };
+  const s = JSON.stringify(payload);
+  return s.length > maxLen ? `${s.slice(0, maxLen)}…` : s;
+}
+
+async function airtableCreateLeadRecord(fields) {
+  const airtableResponse = await fetch(
+    `https://api.airtable.com/v0/${process.env.BASE_ID}/Leads`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.AIRTABLE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ fields }),
+    }
+  );
+  const airtableResult = await airtableResponse.json();
+  return { airtableResponse, airtableResult };
+}
+
 async function handler(req, res) {
   const reqId = crypto.randomBytes(8).toString("hex");
   const t0 = Date.now();
@@ -165,7 +214,7 @@ async function handler(req, res) {
       });
 
       const payload = JSON.parse(rawBody.toString("utf8"));
-      const leadgenId = payload?.entry?.[0]?.changes?.[0]?.value?.leadgen_id;
+      const { leadgenId, webhookValue } = extractLeadgenFromPayload(payload);
       emitRequestLog({
         svc: "meta-webhook",
         event: "post_json_parsed",
@@ -239,51 +288,50 @@ async function handler(req, res) {
         return res.status(200).json({ ok: true, duplicate: true });
       }
 
-      // Graph API'den lead detaylarını çek
+      // Graph API: sürüm + fields (sürümsüz URL bazı ortamlarda 400/deprecated verebilir).
+      const gv = graphApiVersion();
+      const graphQs = new URLSearchParams({
+        access_token: String(process.env.PAGE_TOKEN || ""),
+        fields:
+          "field_data,created_time,id,ad_id,form_id,page_id,adset_id,campaign_id",
+      });
       const leadResponse = await fetch(
-        `https://graph.facebook.com/${leadgenId}?access_token=${process.env.PAGE_TOKEN}`
+        `https://graph.facebook.com/${gv}/${encodeURIComponent(leadgenId)}?${graphQs.toString()}`
       );
       const leadData = await leadResponse.json();
 
-      if (!leadResponse.ok) {
+      let airtableFields;
+
+      if (leadResponse.ok) {
+        const fieldData = leadData.field_data || [];
+        const getFieldValue = (name) =>
+          fieldData.find((f) => f.name === name)?.values?.[0] || null;
+        airtableFields = {
+          "Leadgen ID": leadgenId,
+          "Ad Soyad": getFieldValue("full_name"),
+          "E-posta": getFieldValue("email"),
+          Telefon: getFieldValue("phone_number"),
+        };
+      } else {
         emitRequestLog({
           svc: "meta-webhook",
           event: "post_graph_api_error",
           reqId,
           graphStatus: leadResponse.status,
+          graphErrorCode: leadData?.error?.code,
+          graphErrorType: leadData?.error?.type,
           ms: Date.now() - t0,
         });
-        return res.status(502).json({
-          error: "Failed to fetch lead from Graph API",
-          details: leadData,
-        });
+        // Graph başarısız olsa bile webhook'taki value (page_id, form_id, ad_id, …) Airtable'a gider.
+        const snapName = snapshotFieldName();
+        airtableFields = {
+          "Leadgen ID": leadgenId,
+          [snapName]: buildGraphFallbackSnapshot(webhookValue, leadResponse.status, leadData),
+        };
       }
 
-      const fieldData = leadData.field_data || [];
-      const getFieldValue = (name) =>
-        fieldData.find((f) => f.name === name)?.values?.[0] || null;
-
-      // Airtable'a yaz
-      const airtableResponse = await fetch(
-        `https://api.airtable.com/v0/${process.env.BASE_ID}/Leads`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${process.env.AIRTABLE_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            fields: {
-              "Leadgen ID": leadgenId,
-              "Ad Soyad": getFieldValue("full_name"),
-              "E-posta": getFieldValue("email"),
-              Telefon: getFieldValue("phone_number"),
-            },
-          }),
-        }
-      );
-
-      const airtableResult = await airtableResponse.json();
+      const { airtableResponse, airtableResult } =
+        await airtableCreateLeadRecord(airtableFields);
 
       if (!airtableResponse.ok) {
         emitRequestLog({
@@ -301,10 +349,12 @@ async function handler(req, res) {
 
       emitRequestLog({
         svc: "meta-webhook",
-        event: "post_success_200",
+        event: leadResponse.ok ? "post_success_200" : "post_success_partial_graph",
         reqId,
+        graphOk: leadResponse.ok,
         ms: Date.now() - t0,
       });
+      // Meta webhook: 2xx yeterli; gövde düz metin kalsın.
       return res.status(200).send("OK");
     } catch (error) {
       emitRequestLog({
