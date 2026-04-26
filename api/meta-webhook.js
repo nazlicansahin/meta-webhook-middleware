@@ -141,10 +141,12 @@ function shouldWriteErrorMessageOnGraphFailure() {
   return truthyEnv("AIRTABLE_WRITE_ERROR_MESSAGE_ON_FAILURE");
 }
 
+/**
+ * Source çoğu tabloda single-select → yeni seçenek ekleyemeyen PAT 422 verir.
+ * Yazmak için AIRTABLE_WRITE_SOURCE=true ve LEAD_SOURCE_LABEL tablodaki seçenekle birebir aynı olmalı.
+ */
 function shouldWriteSource() {
-  const v = String(process.env.AIRTABLE_WRITE_SOURCE ?? "").trim().toLowerCase();
-  if (v === "0" || v === "false" || v === "no") return false;
-  return true;
+  return truthyEnv("AIRTABLE_WRITE_SOURCE");
 }
 
 function jsonPreview(obj, maxLen) {
@@ -211,6 +213,7 @@ function idFieldsFromGraphLead(leadData) {
 function buildRawPayloadJson(webhookValue, graphStatus, leadData, graphOk) {
   const maxLen = 95000;
   const payload = {
+    lead_source: leadSourceLabel(),
     webhook_value: webhookValue || null,
     graph_ok: graphOk,
     graph_http_status: graphStatus ?? null,
@@ -477,7 +480,9 @@ async function handler(req, res) {
           pageTokenLength: String(process.env.PAGE_TOKEN || "").length,
           graphHint190:
             ge?.code === 190
-              ? "OAuth 190: PAGE_TOKEN invalid/expired/wrong app. Regenerate long-lived Page token (leads_retrieval, pages_read_engagement, …) and set Vercel PAGE_TOKEN."
+              ? /deleted/i.test(String(ge?.message || ""))
+                ? "OAuth 190: token was issued for a deleted Meta app — create a new app or restore it, then regenerate PAGE_TOKEN."
+                : "OAuth 190: PAGE_TOKEN invalid/expired/wrong app. Regenerate long-lived Page token (leads_retrieval, pages_read_engagement, …) and set Vercel PAGE_TOKEN."
               : undefined,
           ms: Date.now() - t0,
         });
@@ -530,6 +535,10 @@ async function handler(req, res) {
           airtableFieldErrors: airtableResult?.error?.errors,
           airtableBodyPreview: jsonPreview(airtableResult, 12000),
           airtableFieldKeysSent: Object.keys(airtableFields),
+          airtableHint422Select:
+            airtableResult?.error?.type === "INVALID_MULTIPLE_CHOICE_OPTIONS"
+              ? "Single/multi select: value must be an existing option, or use AIRTABLE_WRITE_SOURCE=false (default) and set LEAD_SOURCE_LABEL to match an option before enabling write."
+              : undefined,
           ms: Date.now() - t0,
         });
         return res.status(502).json({
