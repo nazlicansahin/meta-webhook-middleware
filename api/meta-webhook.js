@@ -248,6 +248,15 @@ function shouldIncludeCustomQuestionFields() {
   return true;
 }
 
+/** Legacy EN alanları (Full Name/Email/Phone). Yeni tabloda yoksa false bırak. */
+function shouldWriteLegacyIdentityFields() {
+  const v = String(process.env.AIRTABLE_WRITE_LEGACY_IDENTITY_FIELDS ?? "")
+    .trim()
+    .toLowerCase();
+  if (v === "1" || v === "true" || v === "yes") return true;
+  return false;
+}
+
 function getFieldDataFirstValueMap(fieldData) {
   const out = {};
   for (const f of fieldData || []) {
@@ -560,11 +569,16 @@ async function handler(req, res) {
       const customQuestionFields = shouldIncludeCustomQuestionFields()
         ? fieldValueMap
         : {};
+      const legacyIdentityFields = shouldWriteLegacyIdentityFields()
+        ? {
+            [AT.fullName]: fullNameValue,
+            [AT.email]: emailValue,
+            [AT.phone]: phoneValue,
+          }
+        : {};
       const airtableFields = omitEmptyFields({
         [AT.leadgenId]: leadgenId,
-        [AT.fullName]: fullNameValue,
-        [AT.email]: emailValue,
-        [AT.phone]: phoneValue,
+        ...legacyIdentityFields,
         ...customQuestionFields,
         ...idFieldsFromGraphLead(leadData),
         [rawField]: buildRawPayloadJson(
