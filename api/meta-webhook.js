@@ -72,7 +72,7 @@ async function handler(req, res) {
     const token =
       req.query?.["hub.verify_token"] ?? hub["verify_token"] ?? hub.verify_token;
 
-    if (token === process.env.VERIFY_TOKEN) {
+    if (String(token ?? "").trim() === String(process.env.VERIFY_TOKEN ?? "").trim()) {
       // Meta plain-text bekler.
       return res.status(200).send(String(challenge ?? ""));
     }
@@ -96,7 +96,9 @@ async function handler(req, res) {
       }
 
       // Gerçek lead akışında imza doğrulaması şart (Meta: App Secret + ham gövde).
-      if (!process.env.META_APP_SECRET) {
+      // Vercel/Meta panellerinden kopyalanan secret'ta sık sık sonda \n veya boşluk kalır.
+      const appSecret = String(process.env.META_APP_SECRET ?? "").trim();
+      if (!appSecret) {
         return res.status(500).json({
           error: "META_APP_SECRET is not configured on the server",
         });
@@ -105,9 +107,18 @@ async function handler(req, res) {
       const isValidSignature = verifyMetaSignature(
         rawBody,
         signatureHeader,
-        process.env.META_APP_SECRET
+        appSecret
       );
       if (!isValidSignature) {
+        console.warn(
+          "[meta-webhook] signature_verify_failed",
+          JSON.stringify({
+            hasXHubSignature256: Boolean(signatureHeader),
+            rawBodyByteLength: rawBody.length,
+            appSecretCharLength: appSecret.length,
+            leadgenIdSuffix: String(leadgenId).slice(-8),
+          })
+        );
         return res.status(401).json({ error: "Invalid webhook signature" });
       }
 
