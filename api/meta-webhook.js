@@ -106,6 +106,56 @@ function leadSourceLabel() {
   return String(process.env.LEAD_SOURCE_LABEL || "Meta Lead Ads Webhook").trim();
 }
 
+/** Single select seçenekleri tablodaki etiketlerle birebir eşleşmeli. */
+function syncStatusValueSynced() {
+  return String(process.env.AIRTABLE_SYNC_STATUS_SYNCED || "Synced").trim();
+}
+
+function syncStatusValuePartial() {
+  return String(process.env.AIRTABLE_SYNC_STATUS_PARTIAL || "Partial").trim();
+}
+
+function truthyEnv(name) {
+  const v = String(process.env[name] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+/** Received At çoğu tabloda formül veya otomatik alan → 422. Yazmak için AIRTABLE_WRITE_RECEIVED_AT=true */
+function shouldWriteReceivedAt() {
+  return truthyEnv("AIRTABLE_WRITE_RECEIVED_AT");
+}
+
+function shouldWriteSyncStatus() {
+  const v = String(process.env.AIRTABLE_WRITE_SYNC_STATUS ?? "").trim().toLowerCase();
+  if (v === "0" || v === "false" || v === "no") return false;
+  return true;
+}
+
+/** Graph başarısızken Sync Status yazmak çoğu tabloda 422 (seçenek yok). Açmak için =true */
+function shouldWriteSyncStatusOnGraphFailure() {
+  return truthyEnv("AIRTABLE_WRITE_SYNC_STATUS_ON_FAILURE");
+}
+
+/** Graph hata metni; alan formül/single-line uyumsuzsa 422. Açmak için =true */
+function shouldWriteErrorMessageOnGraphFailure() {
+  return truthyEnv("AIRTABLE_WRITE_ERROR_MESSAGE_ON_FAILURE");
+}
+
+function shouldWriteSource() {
+  const v = String(process.env.AIRTABLE_WRITE_SOURCE ?? "").trim().toLowerCase();
+  if (v === "0" || v === "false" || v === "no") return false;
+  return true;
+}
+
+function jsonPreview(obj, maxLen) {
+  try {
+    const s = JSON.stringify(obj);
+    return s.length > maxLen ? `${s.slice(0, maxLen)}…` : s;
+  } catch {
+    return String(obj).slice(0, maxLen);
+  }
+}
+
 /** Boş / null alanları POST gövdesinden çıkar (Airtable tip hatalarını azaltır). */
 function omitEmptyFields(obj) {
   const out = {};
@@ -400,34 +450,70 @@ async function handler(req, res) {
             leadData,
             true
           ),
-          [AT.source]: leadSourceLabel(),
-          [AT.syncStatus]: "Synced",
-          [AT.receivedAt]: new Date().toISOString(),
+          ...(shouldWriteSource() ? { [AT.source]: leadSourceLabel() } : {}),
+          ...(shouldWriteSyncStatus()
+            ? { [AT.syncStatus]: syncStatusValueSynced() }
+            : {}),
+          ...(shouldWriteReceivedAt()
+            ? { [AT.receivedAt]: new Date().toISOString() }
+            : {}),
         });
       } else {
+        const ge = leadData?.error;
         emitRequestLog({
           svc: "meta-webhook",
           event: "post_graph_api_error",
           reqId,
           graphStatus: leadResponse.status,
-          graphErrorCode: leadData?.error?.code,
-          graphErrorType: leadData?.error?.type,
+          graphErrorCode: ge?.code,
+          graphErrorType: ge?.type,
+          graphErrorMessage: ge?.message,
+          graphErrorSubcode: ge?.error_subcode,
+          graphFbtraceId: ge?.fbtrace_id,
+          graphErrorUserMsg: ge?.error_user_msg,
+          graphErrorUserTitle: ge?.error_user_title,
+          graphErrorFull: jsonPreview(leadData, 4000),
+          pageTokenConfigured: Boolean(String(process.env.PAGE_TOKEN || "").trim()),
+          pageTokenLength: String(process.env.PAGE_TOKEN || "").length,
+          graphHint190:
+            ge?.code === 190
+              ? "OAuth 190: PAGE_TOKEN invalid/expired/wrong app. Regenerate long-lived Page token (leads_retrieval, pages_read_engagement, …) and set Vercel PAGE_TOKEN."
+              : undefined,
           ms: Date.now() - t0,
         });
-        airtableFields = omitEmptyFields({
-          [AT.leadgenId]: leadgenId,
-          ...idFieldsFromWebhookValue(webhookValue),
-          [rawField]: buildRawPayloadJson(
-            webhookValue,
-            leadResponse.status,
-            leadData,
-            false
-          ),
-          [AT.source]: leadSourceLabel(),
-          [AT.syncStatus]: "Partial — Graph API",
-          [AT.errorMessage]: graphErrorMessage(leadData),
-          [AT.receivedAt]: new Date().toISOString(),
-        });
+        // AIRTABLE_PARTIAL_MINIMAL=true → sadece Leadgen ID + Raw Payload (422 debug / tek seçenek)
+        if (truthyEnv("AIRTABLE_PARTIAL_MINIMAL")) {
+          airtableFields = omitEmptyFields({
+            [AT.leadgenId]: leadgenId,
+            [rawField]: buildRawPayloadJson(
+              webhookValue,
+              leadResponse.status,
+              leadData,
+              false
+            ),
+          });
+        } else {
+          airtableFields = omitEmptyFields({
+            [AT.leadgenId]: leadgenId,
+            ...idFieldsFromWebhookValue(webhookValue),
+            [rawField]: buildRawPayloadJson(
+              webhookValue,
+              leadResponse.status,
+              leadData,
+              false
+            ),
+            ...(shouldWriteSource() ? { [AT.source]: leadSourceLabel() } : {}),
+            ...(shouldWriteSyncStatusOnGraphFailure()
+              ? { [AT.syncStatus]: syncStatusValuePartial() }
+              : {}),
+            ...(shouldWriteErrorMessageOnGraphFailure()
+              ? { [AT.errorMessage]: graphErrorMessage(leadData) }
+              : {}),
+            ...(shouldWriteReceivedAt()
+              ? { [AT.receivedAt]: new Date().toISOString() }
+              : {}),
+          });
+        }
       }
 
       const { airtableResponse, airtableResult } =
@@ -439,6 +525,11 @@ async function handler(req, res) {
           event: "post_airtable_write_error",
           reqId,
           airtableStatus: airtableResponse.status,
+          airtableErrorType: airtableResult?.error?.type,
+          airtableErrorMessage: airtableResult?.error?.message,
+          airtableFieldErrors: airtableResult?.error?.errors,
+          airtableBodyPreview: jsonPreview(airtableResult, 12000),
+          airtableFieldKeysSent: Object.keys(airtableFields),
           ms: Date.now() - t0,
         });
         return res.status(502).json({
