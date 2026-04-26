@@ -43,6 +43,26 @@ function verifyMetaSignature(rawBody, signatureHeader, appSecret) {
   return crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
 }
 
+/** One JSON line per event — search Vercel Runtime Logs for `svc":"meta-webhook"` */
+function emitRequestLog(payload) {
+  process.stdout.write(
+    `${JSON.stringify({ ts: new Date().toISOString(), ...payload })}\n`
+  );
+}
+
+function safeRequestHeaders(req) {
+  return {
+    host: headerString(req, "host"),
+    userAgent: headerString(req, "user-agent"),
+    contentType: headerString(req, "content-type"),
+    contentLength: headerString(req, "content-length"),
+    forwardedFor: headerString(req, "x-forwarded-for"),
+    vercelId: headerString(req, "x-vercel-id"),
+    vercelDeploymentId: headerString(req, "x-vercel-deployment-id"),
+    hasXHubSignature256: Boolean(headerString(req, "x-hub-signature-256")),
+  };
+}
+
 async function airtableRecordExists(leadgenId) {
   const formula = encodeURIComponent(`{Leadgen ID}='${leadgenId}'`);
   const url = `https://api.airtable.com/v0/${process.env.BASE_ID}/Leads?maxRecords=1&filterByFormula=${formula}`;
@@ -62,6 +82,33 @@ async function airtableRecordExists(leadgenId) {
 }
 
 async function handler(req, res) {
+  const reqId = crypto.randomBytes(8).toString("hex");
+  const t0 = Date.now();
+  const pathOnly = String(req.url || "/").split("?")[0];
+
+  res.once("finish", () => {
+    emitRequestLog({
+      svc: "meta-webhook",
+      event: "response_sent",
+      reqId,
+      method: req.method,
+      path: pathOnly,
+      statusCode: res.statusCode,
+      ms: Date.now() - t0,
+    });
+  });
+
+  emitRequestLog({
+    svc: "meta-webhook",
+    event: "request_received",
+    reqId,
+    method: req.method,
+    path: pathOnly,
+    queryParamKeys: Object.keys(req.query || {}),
+    headers: safeRequestHeaders(req),
+    ms: 0,
+  });
+
   // 1) Meta webhook doğrulaması (GET)
   if (req.method === "GET") {
     // Meta query param isimleri noktalar içerdiği için bazı framework'ler
@@ -72,7 +119,23 @@ async function handler(req, res) {
     const token =
       req.query?.["hub.verify_token"] ?? hub["verify_token"] ?? hub.verify_token;
 
-    if (String(token ?? "").trim() === String(process.env.VERIFY_TOKEN ?? "").trim()) {
+    const verifyMatch =
+      String(token ?? "").trim() ===
+      String(process.env.VERIFY_TOKEN ?? "").trim();
+    emitRequestLog({
+      svc: "meta-webhook",
+      event: "get_webhook_handshake",
+      reqId,
+      hasChallenge: challenge != null && String(challenge).length > 0,
+      hasVerifyTokenParam: Boolean(token && String(token).length > 0),
+      verifyTokenMatch: verifyMatch,
+      envVerifyTokenConfigured: Boolean(
+        String(process.env.VERIFY_TOKEN ?? "").trim()
+      ),
+      ms: Date.now() - t0,
+    });
+
+    if (verifyMatch) {
       // Meta plain-text bekler.
       return res.status(200).send(String(challenge ?? ""));
     }
@@ -83,30 +146,44 @@ async function handler(req, res) {
   // 2) Gerçek lead geldiğinde (POST)
   if (req.method === "POST") {
     try {
-      // Vercel'de istek satırı ile aynı yerde görünmesi için stdout (console.log) kullan.
-      console.log("[meta-webhook] POST start");
+      emitRequestLog({
+        svc: "meta-webhook",
+        event: "post_read_start",
+        reqId,
+        ms: Date.now() - t0,
+      });
 
       const rawBody = await getRawBody(req);
       const signatureHeader = headerString(req, "x-hub-signature-256");
-      console.log(
-        "[meta-webhook] POST body",
-        JSON.stringify({
-          rawBytes: rawBody.length,
-          hasXHubSignature256: Boolean(signatureHeader),
-        })
-      );
+      emitRequestLog({
+        svc: "meta-webhook",
+        event: "post_body_read",
+        reqId,
+        rawBytes: rawBody.length,
+        hasXHubSignature256: Boolean(signatureHeader),
+        ms: Date.now() - t0,
+      });
 
       const payload = JSON.parse(rawBody.toString("utf8"));
       const leadgenId = payload?.entry?.[0]?.changes?.[0]?.value?.leadgen_id;
-      console.log(
-        "[meta-webhook] POST parsed",
-        JSON.stringify({ hasLeadgenId: Boolean(leadgenId) })
-      );
+      emitRequestLog({
+        svc: "meta-webhook",
+        event: "post_json_parsed",
+        reqId,
+        topLevelKeys: payload && typeof payload === "object" ? Object.keys(payload) : [],
+        hasLeadgenId: Boolean(leadgenId),
+        ms: Date.now() - t0,
+      });
 
       if (!leadgenId) {
         // Meta "Verify and save" sırasında test POST atabilir.
         // Bu durumda `leadgen_id` gelmeyebileceği için imza doğrulaması yapmadan 200 dönmek doğrulamanın geçmesini sağlar.
-        console.log("[meta-webhook] POST exit 200 no_leadgen_id (signature skipped)");
+        emitRequestLog({
+          svc: "meta-webhook",
+          event: "post_no_leadgen_id_200",
+          reqId,
+          ms: Date.now() - t0,
+        });
         return res.status(200).send("OK");
       }
 
@@ -114,6 +191,12 @@ async function handler(req, res) {
       // Vercel/Meta panellerinden kopyalanan secret'ta sık sık sonda \n veya boşluk kalır.
       const appSecret = String(process.env.META_APP_SECRET ?? "").trim();
       if (!appSecret) {
+        emitRequestLog({
+          svc: "meta-webhook",
+          event: "post_missing_meta_app_secret",
+          reqId,
+          ms: Date.now() - t0,
+        });
         return res.status(500).json({
           error: "META_APP_SECRET is not configured on the server",
         });
@@ -125,22 +208,34 @@ async function handler(req, res) {
         appSecret
       );
       if (!isValidSignature) {
-        console.log(
-          "[meta-webhook] signature_verify_failed",
-          JSON.stringify({
-            hasXHubSignature256: Boolean(signatureHeader),
-            rawBodyByteLength: rawBody.length,
-            appSecretCharLength: appSecret.length,
-            leadgenIdSuffix: String(leadgenId).slice(-8),
-          })
-        );
+        emitRequestLog({
+          svc: "meta-webhook",
+          event: "post_signature_invalid",
+          reqId,
+          hasXHubSignature256: Boolean(signatureHeader),
+          rawBodyByteLength: rawBody.length,
+          appSecretCharLength: appSecret.length,
+          leadgenIdSuffix: String(leadgenId).slice(-8),
+          ms: Date.now() - t0,
+        });
         return res.status(401).json({ error: "Invalid webhook signature" });
       }
 
-      console.log("[meta-webhook] POST signature ok");
+      emitRequestLog({
+        svc: "meta-webhook",
+        event: "post_signature_ok",
+        reqId,
+        ms: Date.now() - t0,
+      });
 
       const alreadyExists = await airtableRecordExists(leadgenId);
       if (alreadyExists) {
+        emitRequestLog({
+          svc: "meta-webhook",
+          event: "post_duplicate_skip_airtable",
+          reqId,
+          ms: Date.now() - t0,
+        });
         return res.status(200).json({ ok: true, duplicate: true });
       }
 
@@ -151,6 +246,13 @@ async function handler(req, res) {
       const leadData = await leadResponse.json();
 
       if (!leadResponse.ok) {
+        emitRequestLog({
+          svc: "meta-webhook",
+          event: "post_graph_api_error",
+          reqId,
+          graphStatus: leadResponse.status,
+          ms: Date.now() - t0,
+        });
         return res.status(502).json({
           error: "Failed to fetch lead from Graph API",
           details: leadData,
@@ -184,18 +286,34 @@ async function handler(req, res) {
       const airtableResult = await airtableResponse.json();
 
       if (!airtableResponse.ok) {
+        emitRequestLog({
+          svc: "meta-webhook",
+          event: "post_airtable_write_error",
+          reqId,
+          airtableStatus: airtableResponse.status,
+          ms: Date.now() - t0,
+        });
         return res.status(502).json({
           error: "Failed to write to Airtable",
           details: airtableResult,
         });
       }
 
+      emitRequestLog({
+        svc: "meta-webhook",
+        event: "post_success_200",
+        reqId,
+        ms: Date.now() - t0,
+      });
       return res.status(200).send("OK");
     } catch (error) {
-      console.log(
-        "[meta-webhook] POST catch",
-        JSON.stringify({ message: error?.message || String(error) })
-      );
+      emitRequestLog({
+        svc: "meta-webhook",
+        event: "post_uncaught_error",
+        reqId,
+        message: error?.message || String(error),
+        ms: Date.now() - t0,
+      });
       return res.status(500).json({
         error: "Internal server error",
         details: error.message,
@@ -203,6 +321,13 @@ async function handler(req, res) {
     }
   }
 
+  emitRequestLog({
+    svc: "meta-webhook",
+    event: "method_not_allowed",
+    reqId,
+    method: req.method,
+    ms: Date.now() - t0,
+  });
   return res.status(405).json({ error: "Method not allowed" });
 }
 
