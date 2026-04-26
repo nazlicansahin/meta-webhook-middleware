@@ -83,15 +83,30 @@ async function handler(req, res) {
   // 2) Gerçek lead geldiğinde (POST)
   if (req.method === "POST") {
     try {
+      // Vercel'de istek satırı ile aynı yerde görünmesi için stdout (console.log) kullan.
+      console.log("[meta-webhook] POST start");
+
       const rawBody = await getRawBody(req);
       const signatureHeader = headerString(req, "x-hub-signature-256");
+      console.log(
+        "[meta-webhook] POST body",
+        JSON.stringify({
+          rawBytes: rawBody.length,
+          hasXHubSignature256: Boolean(signatureHeader),
+        })
+      );
 
       const payload = JSON.parse(rawBody.toString("utf8"));
       const leadgenId = payload?.entry?.[0]?.changes?.[0]?.value?.leadgen_id;
+      console.log(
+        "[meta-webhook] POST parsed",
+        JSON.stringify({ hasLeadgenId: Boolean(leadgenId) })
+      );
 
       if (!leadgenId) {
         // Meta "Verify and save" sırasında test POST atabilir.
         // Bu durumda `leadgen_id` gelmeyebileceği için imza doğrulaması yapmadan 200 dönmek doğrulamanın geçmesini sağlar.
+        console.log("[meta-webhook] POST exit 200 no_leadgen_id (signature skipped)");
         return res.status(200).send("OK");
       }
 
@@ -110,7 +125,7 @@ async function handler(req, res) {
         appSecret
       );
       if (!isValidSignature) {
-        console.warn(
+        console.log(
           "[meta-webhook] signature_verify_failed",
           JSON.stringify({
             hasXHubSignature256: Boolean(signatureHeader),
@@ -121,6 +136,8 @@ async function handler(req, res) {
         );
         return res.status(401).json({ error: "Invalid webhook signature" });
       }
+
+      console.log("[meta-webhook] POST signature ok");
 
       const alreadyExists = await airtableRecordExists(leadgenId);
       if (alreadyExists) {
@@ -175,6 +192,10 @@ async function handler(req, res) {
 
       return res.status(200).send("OK");
     } catch (error) {
+      console.log(
+        "[meta-webhook] POST catch",
+        JSON.stringify({ message: error?.message || String(error) })
+      );
       return res.status(500).json({
         error: "Internal server error",
         details: error.message,
