@@ -102,6 +102,10 @@ function rawPayloadFieldName() {
   return String(process.env.AIRTABLE_RAW_PAYLOAD_FIELD || AT.rawPayload).trim() || AT.rawPayload;
 }
 
+function airtableTableName() {
+  return String(process.env.AIRTABLE_TABLE_NAME || "Leads").trim() || "Leads";
+}
+
 function leadSourceLabel() {
   return String(process.env.LEAD_SOURCE_LABEL || "Meta Lead Ads Webhook").trim();
 }
@@ -281,7 +285,9 @@ function pickFromMap(map, keys) {
 
 async function airtableRecordExists(leadgenId) {
   const formula = encodeURIComponent(`{${AT.leadgenId}}='${leadgenId}'`);
-  const url = `https://api.airtable.com/v0/${process.env.BASE_ID}/Leads?maxRecords=1&filterByFormula=${formula}`;
+  const url = `https://api.airtable.com/v0/${process.env.BASE_ID}/${encodeURIComponent(
+    airtableTableName()
+  )}?maxRecords=1&filterByFormula=${formula}`;
 
   const response = await fetch(url, {
     headers: {
@@ -299,7 +305,9 @@ async function airtableRecordExists(leadgenId) {
 
 async function airtableCreateLeadRecord(fields) {
   const airtableResponse = await fetch(
-    `https://api.airtable.com/v0/${process.env.BASE_ID}/Leads`,
+    `https://api.airtable.com/v0/${process.env.BASE_ID}/${encodeURIComponent(
+      airtableTableName()
+    )}`,
     {
       method: "POST",
       headers: {
@@ -637,6 +645,8 @@ async function handler(req, res) {
         event: "post_uncaught_error",
         reqId,
         message: error?.message || String(error),
+        airtableBaseIdConfigured: Boolean(String(process.env.BASE_ID || "").trim()),
+        airtableTableName: airtableTableName(),
         ms: Date.now() - t0,
       });
       return res.status(500).json({
