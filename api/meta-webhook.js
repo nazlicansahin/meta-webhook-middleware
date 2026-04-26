@@ -240,6 +240,36 @@ function graphNoResponseNote(leadData) {
   return detail ? `${base} - ${detail}`.slice(0, 10000) : base;
 }
 
+function shouldIncludeCustomQuestionFields() {
+  const v = String(process.env.AIRTABLE_INCLUDE_CUSTOM_QUESTION_FIELDS ?? "")
+    .trim()
+    .toLowerCase();
+  if (v === "0" || v === "false" || v === "no") return false;
+  return true;
+}
+
+function getFieldDataFirstValueMap(fieldData) {
+  const out = {};
+  for (const f of fieldData || []) {
+    const name = String(f?.name || "").trim();
+    if (!name) continue;
+    const values = Array.isArray(f?.values) ? f.values : [];
+    if (values.length === 0) continue;
+    const first = values[0];
+    if (first == null) continue;
+    out[name] = typeof first === "string" ? first : JSON.stringify(first);
+  }
+  return out;
+}
+
+function pickFromMap(map, keys) {
+  for (const k of keys) {
+    const v = map[k];
+    if (v != null && String(v).trim() !== "") return v;
+  }
+  return null;
+}
+
 async function airtableRecordExists(leadgenId) {
   const formula = encodeURIComponent(`{${AT.leadgenId}}='${leadgenId}'`);
   const url = `https://api.airtable.com/v0/${process.env.BASE_ID}/Leads?maxRecords=1&filterByFormula=${formula}`;
@@ -517,13 +547,25 @@ async function handler(req, res) {
       }
 
       const fieldData = leadData.field_data || [];
-      const getFieldValue = (name) =>
-        fieldData.find((f) => f.name === name)?.values?.[0] || null;
+      const fieldValueMap = getFieldDataFirstValueMap(fieldData);
+      const fullNameValue = pickFromMap(fieldValueMap, [
+        "full_name",
+        "Adınız Soyadınız",
+      ]);
+      const emailValue = pickFromMap(fieldValueMap, ["email", "E-posta Adresiniz"]);
+      const phoneValue = pickFromMap(fieldValueMap, [
+        "phone_number",
+        "Telefon Numaranız",
+      ]);
+      const customQuestionFields = shouldIncludeCustomQuestionFields()
+        ? fieldValueMap
+        : {};
       const airtableFields = omitEmptyFields({
         [AT.leadgenId]: leadgenId,
-        [AT.fullName]: getFieldValue("full_name"),
-        [AT.email]: getFieldValue("email"),
-        [AT.phone]: getFieldValue("phone_number"),
+        [AT.fullName]: fullNameValue,
+        [AT.email]: emailValue,
+        [AT.phone]: phoneValue,
+        ...customQuestionFields,
         ...idFieldsFromGraphLead(leadData),
         [rawField]: buildRawPayloadJson(
           webhookValue,
