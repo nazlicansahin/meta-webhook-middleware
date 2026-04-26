@@ -63,24 +63,6 @@ function safeRequestHeaders(req) {
   };
 }
 
-async function airtableRecordExists(leadgenId) {
-  const formula = encodeURIComponent(`{Leadgen ID}='${leadgenId}'`);
-  const url = `https://api.airtable.com/v0/${process.env.BASE_ID}/Leads?maxRecords=1&filterByFormula=${formula}`;
-
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${process.env.AIRTABLE_KEY}`,
-    },
-  });
-
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(`Airtable lookup failed: ${JSON.stringify(data)}`);
-  }
-
-  return Array.isArray(data.records) && data.records.length > 0;
-}
-
 /** İlk leadgen değişikliğini bul (tek POST'ta birden fazla changes olabilir). */
 function extractLeadgenFromPayload(payload) {
   for (const ent of payload?.entry || []) {
@@ -99,19 +81,118 @@ function graphApiVersion() {
   return raw.startsWith("v") ? raw : `v${raw}`;
 }
 
-function snapshotFieldName() {
-  return String(process.env.AIRTABLE_SNAPSHOT_FIELD || "Meta Snapshot").trim() || "Meta Snapshot";
+/** Airtable tablosu (Leads-Grid view.csv) ile aynı alan adları. */
+const AT = {
+  leadgenId: "Leadgen ID",
+  fullName: "Full Name",
+  email: "Email",
+  phone: "Phone",
+  formId: "Form ID",
+  pageId: "Page ID",
+  adId: "Ad ID",
+  createdTimeMeta: "Created Time (Meta)",
+  rawPayload: "Raw Payload",
+  source: "Source",
+  syncStatus: "Sync Status",
+  errorMessage: "Error Message",
+  receivedAt: "Received At",
+};
+
+function rawPayloadFieldName() {
+  return String(process.env.AIRTABLE_RAW_PAYLOAD_FIELD || AT.rawPayload).trim() || AT.rawPayload;
 }
 
-function buildGraphFallbackSnapshot(webhookValue, graphStatus, leadData) {
+function leadSourceLabel() {
+  return String(process.env.LEAD_SOURCE_LABEL || "Meta Lead Ads Webhook").trim();
+}
+
+/** Boş / null alanları POST gövdesinden çıkar (Airtable tip hatalarını azaltır). */
+function omitEmptyFields(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined || v === null) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/** Webhook `value` içindeki ID / zaman alanları → CSV sütunları. */
+function idFieldsFromWebhookValue(v) {
+  if (!v || typeof v !== "object") return {};
+  const out = {};
+  if (v.form_id != null && String(v.form_id).length > 0) {
+    out[AT.formId] = String(v.form_id);
+  }
+  if (v.page_id != null && String(v.page_id).length > 0) {
+    out[AT.pageId] = String(v.page_id);
+  }
+  if (v.ad_id != null && String(v.ad_id).length > 0) {
+    out[AT.adId] = String(v.ad_id);
+  }
+  if (v.created_time != null) {
+    const sec = Number(v.created_time);
+    if (!Number.isNaN(sec) && sec > 0) {
+      out[AT.createdTimeMeta] = new Date(sec * 1000).toISOString();
+    }
+  }
+  return out;
+}
+
+/** Graph lead cevabından CSV sütunları (created_time genelde ISO string). */
+function idFieldsFromGraphLead(leadData) {
+  if (!leadData || typeof leadData !== "object") return {};
+  const out = {};
+  if (leadData.form_id != null && String(leadData.form_id).length > 0) {
+    out[AT.formId] = String(leadData.form_id);
+  }
+  if (leadData.page_id != null && String(leadData.page_id).length > 0) {
+    out[AT.pageId] = String(leadData.page_id);
+  }
+  if (leadData.ad_id != null && String(leadData.ad_id).length > 0) {
+    out[AT.adId] = String(leadData.ad_id);
+  }
+  if (leadData.created_time) {
+    out[AT.createdTimeMeta] = String(leadData.created_time);
+  }
+  return out;
+}
+
+function buildRawPayloadJson(webhookValue, graphStatus, leadData, graphOk) {
   const maxLen = 95000;
   const payload = {
     webhook_value: webhookValue || null,
+    graph_ok: graphOk,
     graph_http_status: graphStatus ?? null,
-    graph_error: leadData?.error ?? leadData ?? null,
+    graph_body: graphOk ? leadData : leadData?.error ?? leadData ?? null,
   };
   const s = JSON.stringify(payload);
   return s.length > maxLen ? `${s.slice(0, maxLen)}…` : s;
+}
+
+function graphErrorMessage(leadData) {
+  const e = leadData?.error;
+  if (!e) return JSON.stringify(leadData ?? {}).slice(0, 8000);
+  const parts = [e.message, e.type && `type=${e.type}`, e.code != null && `code=${e.code}`].filter(Boolean);
+  return parts.join(" | ").slice(0, 10000);
+}
+
+async function airtableRecordExists(leadgenId) {
+  const formula = encodeURIComponent(`{${AT.leadgenId}}='${leadgenId}'`);
+  const url = `https://api.airtable.com/v0/${process.env.BASE_ID}/Leads?maxRecords=1&filterByFormula=${formula}`;
+
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${process.env.AIRTABLE_KEY}`,
+    },
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Airtable lookup failed: ${JSON.stringify(data)}`);
+  }
+
+  return Array.isArray(data.records) && data.records.length > 0;
 }
 
 async function airtableCreateLeadRecord(fields) {
@@ -285,7 +366,7 @@ async function handler(req, res) {
           reqId,
           ms: Date.now() - t0,
         });
-        return res.status(200).json({ ok: true, duplicate: true });
+        return res.status(200).send("OK");
       }
 
       // Graph API: sürüm + fields (sürümsüz URL bazı ortamlarda 400/deprecated verebilir).
@@ -300,18 +381,29 @@ async function handler(req, res) {
       );
       const leadData = await leadResponse.json();
 
+      const rawField = rawPayloadFieldName();
       let airtableFields;
 
       if (leadResponse.ok) {
         const fieldData = leadData.field_data || [];
         const getFieldValue = (name) =>
           fieldData.find((f) => f.name === name)?.values?.[0] || null;
-        airtableFields = {
-          "Leadgen ID": leadgenId,
-          "Ad Soyad": getFieldValue("full_name"),
-          "E-posta": getFieldValue("email"),
-          Telefon: getFieldValue("phone_number"),
-        };
+        airtableFields = omitEmptyFields({
+          [AT.leadgenId]: leadgenId,
+          [AT.fullName]: getFieldValue("full_name"),
+          [AT.email]: getFieldValue("email"),
+          [AT.phone]: getFieldValue("phone_number"),
+          ...idFieldsFromGraphLead(leadData),
+          [rawField]: buildRawPayloadJson(
+            webhookValue,
+            leadResponse.status,
+            leadData,
+            true
+          ),
+          [AT.source]: leadSourceLabel(),
+          [AT.syncStatus]: "Synced",
+          [AT.receivedAt]: new Date().toISOString(),
+        });
       } else {
         emitRequestLog({
           svc: "meta-webhook",
@@ -322,12 +414,20 @@ async function handler(req, res) {
           graphErrorType: leadData?.error?.type,
           ms: Date.now() - t0,
         });
-        // Graph başarısız olsa bile webhook'taki value (page_id, form_id, ad_id, …) Airtable'a gider.
-        const snapName = snapshotFieldName();
-        airtableFields = {
-          "Leadgen ID": leadgenId,
-          [snapName]: buildGraphFallbackSnapshot(webhookValue, leadResponse.status, leadData),
-        };
+        airtableFields = omitEmptyFields({
+          [AT.leadgenId]: leadgenId,
+          ...idFieldsFromWebhookValue(webhookValue),
+          [rawField]: buildRawPayloadJson(
+            webhookValue,
+            leadResponse.status,
+            leadData,
+            false
+          ),
+          [AT.source]: leadSourceLabel(),
+          [AT.syncStatus]: "Partial — Graph API",
+          [AT.errorMessage]: graphErrorMessage(leadData),
+          [AT.receivedAt]: new Date().toISOString(),
+        });
       }
 
       const { airtableResponse, airtableResult } =
