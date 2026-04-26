@@ -136,9 +136,13 @@ function shouldWriteSyncStatusOnGraphFailure() {
   return truthyEnv("AIRTABLE_WRITE_SYNC_STATUS_ON_FAILURE");
 }
 
-/** Graph hata metni; alan formül/single-line uyumsuzsa 422. Açmak için =true */
+/** Graph hata notu varsayılan açık; kapatmak için AIRTABLE_WRITE_ERROR_MESSAGE_ON_FAILURE=false */
 function shouldWriteErrorMessageOnGraphFailure() {
-  return truthyEnv("AIRTABLE_WRITE_ERROR_MESSAGE_ON_FAILURE");
+  const v = String(process.env.AIRTABLE_WRITE_ERROR_MESSAGE_ON_FAILURE ?? "")
+    .trim()
+    .toLowerCase();
+  if (v === "0" || v === "false" || v === "no") return false;
+  return true;
 }
 
 /**
@@ -228,6 +232,12 @@ function graphErrorMessage(leadData) {
   if (!e) return JSON.stringify(leadData ?? {}).slice(0, 8000);
   const parts = [e.message, e.type && `type=${e.type}`, e.code != null && `code=${e.code}`].filter(Boolean);
   return parts.join(" | ").slice(0, 10000);
+}
+
+function graphNoResponseNote(leadData) {
+  const base = "Graph çağrısından dönüş olmadı";
+  const detail = graphErrorMessage(leadData);
+  return detail ? `${base} - ${detail}`.slice(0, 10000) : base;
 }
 
 async function airtableRecordExists(leadgenId) {
@@ -426,8 +436,7 @@ async function handler(req, res) {
       const gv = graphApiVersion();
       const graphQs = new URLSearchParams({
         access_token: String(process.env.PAGE_TOKEN || ""),
-        fields:
-          "field_data,created_time,id,ad_id,form_id,page_id,adset_id,campaign_id",
+        fields: "field_data,created_time,id,ad_id,form_id,adset_id,campaign_id",
       });
       const leadResponse = await fetch(
         `https://graph.facebook.com/${gv}/${encodeURIComponent(leadgenId)}?${graphQs.toString()}`
@@ -435,33 +444,7 @@ async function handler(req, res) {
       const leadData = await leadResponse.json();
 
       const rawField = rawPayloadFieldName();
-      let airtableFields;
-
-      if (leadResponse.ok) {
-        const fieldData = leadData.field_data || [];
-        const getFieldValue = (name) =>
-          fieldData.find((f) => f.name === name)?.values?.[0] || null;
-        airtableFields = omitEmptyFields({
-          [AT.leadgenId]: leadgenId,
-          [AT.fullName]: getFieldValue("full_name"),
-          [AT.email]: getFieldValue("email"),
-          [AT.phone]: getFieldValue("phone_number"),
-          ...idFieldsFromGraphLead(leadData),
-          [rawField]: buildRawPayloadJson(
-            webhookValue,
-            leadResponse.status,
-            leadData,
-            true
-          ),
-          ...(shouldWriteSource() ? { [AT.source]: leadSourceLabel() } : {}),
-          ...(shouldWriteSyncStatus()
-            ? { [AT.syncStatus]: syncStatusValueSynced() }
-            : {}),
-          ...(shouldWriteReceivedAt()
-            ? { [AT.receivedAt]: new Date().toISOString() }
-            : {}),
-        });
-      } else {
+      if (!leadResponse.ok) {
         const ge = leadData?.error;
         emitRequestLog({
           svc: "meta-webhook",
@@ -486,40 +469,76 @@ async function handler(req, res) {
               : undefined,
           ms: Date.now() - t0,
         });
-        // AIRTABLE_PARTIAL_MINIMAL=true → sadece Leadgen ID + Raw Payload (422 debug / tek seçenek)
-        if (truthyEnv("AIRTABLE_PARTIAL_MINIMAL")) {
-          airtableFields = omitEmptyFields({
-            [AT.leadgenId]: leadgenId,
-            [rawField]: buildRawPayloadJson(
-              webhookValue,
-              leadResponse.status,
-              leadData,
-              false
-            ),
+        emitRequestLog({
+          svc: "meta-webhook",
+          event: "post_airtable_graph_note_attempt",
+          reqId,
+          reason: "graph_fetch_failed_write_note_only",
+          ms: Date.now() - t0,
+        });
+
+        // Graph başarısızsa ham lead yazma; sadece not amaçlı minimal kayıt.
+        const graphFailFields = omitEmptyFields({
+          [AT.leadgenId]: leadgenId,
+          ...idFieldsFromWebhookValue(webhookValue),
+          ...(shouldWriteErrorMessageOnGraphFailure()
+            ? { [AT.errorMessage]: graphNoResponseNote(leadData) }
+            : {}),
+          ...(shouldWriteReceivedAt()
+            ? { [AT.receivedAt]: new Date().toISOString() }
+            : {}),
+        });
+        const { airtableResponse: noteResponse, airtableResult: noteResult } =
+          await airtableCreateLeadRecord(graphFailFields);
+        if (!noteResponse.ok) {
+          emitRequestLog({
+            svc: "meta-webhook",
+            event: "post_airtable_graph_note_error",
+            reqId,
+            airtableStatus: noteResponse.status,
+            airtableErrorType: noteResult?.error?.type,
+            airtableErrorMessage: noteResult?.error?.message,
+            airtableFieldKeysSent: Object.keys(graphFailFields),
+            ms: Date.now() - t0,
           });
         } else {
-          airtableFields = omitEmptyFields({
-            [AT.leadgenId]: leadgenId,
-            ...idFieldsFromWebhookValue(webhookValue),
-            [rawField]: buildRawPayloadJson(
-              webhookValue,
-              leadResponse.status,
-              leadData,
-              false
-            ),
-            ...(shouldWriteSource() ? { [AT.source]: leadSourceLabel() } : {}),
-            ...(shouldWriteSyncStatusOnGraphFailure()
-              ? { [AT.syncStatus]: syncStatusValuePartial() }
-              : {}),
-            ...(shouldWriteErrorMessageOnGraphFailure()
-              ? { [AT.errorMessage]: graphErrorMessage(leadData) }
-              : {}),
-            ...(shouldWriteReceivedAt()
-              ? { [AT.receivedAt]: new Date().toISOString() }
-              : {}),
+          emitRequestLog({
+            svc: "meta-webhook",
+            event: "post_airtable_graph_note_ok",
+            reqId,
+            airtableFieldKeysSent: Object.keys(graphFailFields),
+            ms: Date.now() - t0,
           });
         }
+        return res.status(502).json({
+          error: "Failed to fetch lead from Graph API",
+          details: leadData,
+        });
       }
+
+      const fieldData = leadData.field_data || [];
+      const getFieldValue = (name) =>
+        fieldData.find((f) => f.name === name)?.values?.[0] || null;
+      const airtableFields = omitEmptyFields({
+        [AT.leadgenId]: leadgenId,
+        [AT.fullName]: getFieldValue("full_name"),
+        [AT.email]: getFieldValue("email"),
+        [AT.phone]: getFieldValue("phone_number"),
+        ...idFieldsFromGraphLead(leadData),
+        [rawField]: buildRawPayloadJson(
+          webhookValue,
+          leadResponse.status,
+          leadData,
+          true
+        ),
+        ...(shouldWriteSource() ? { [AT.source]: leadSourceLabel() } : {}),
+        ...(shouldWriteSyncStatus()
+          ? { [AT.syncStatus]: syncStatusValueSynced() }
+          : {}),
+        ...(shouldWriteReceivedAt()
+          ? { [AT.receivedAt]: new Date().toISOString() }
+          : {}),
+      });
 
       const { airtableResponse, airtableResult } =
         await airtableCreateLeadRecord(airtableFields);
@@ -549,9 +568,9 @@ async function handler(req, res) {
 
       emitRequestLog({
         svc: "meta-webhook",
-        event: leadResponse.ok ? "post_success_200" : "post_success_partial_graph",
+        event: "post_success_200",
         reqId,
-        graphOk: leadResponse.ok,
+        graphOk: true,
         ms: Date.now() - t0,
       });
       // Meta webhook: 2xx yeterli; gövde düz metin kalsın.
